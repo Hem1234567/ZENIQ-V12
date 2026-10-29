@@ -1,0 +1,225 @@
+name: Build ZENIQ APK
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Java 17 ────────────────────────────────────────────────────────
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ── 3. Android SDK (pre-installed on runner, just add NDK+cmake) ──────
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -e
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDK="$ANDROID_HOME"
+
+          # Accept licences
+          mkdir -p "$SDK/licenses"
+          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n84831b9409646a918e30573bab4c9c91346d8abd\n" \
+            > "$SDK/licenses/android-sdk-license"
+          printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
+            > "$SDK/licenses/android-sdk-preview-license"
+
+          SDKM=$(find "$SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)
+          [ -n "$SDKM" ] || { echo "ERROR: sdkmanager not found"; find "$SDK" -name sdkmanager 2>/dev/null; exit 1; }
+          echo "sdkmanager: $SDKM"
+
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" "platforms;android-35" "build-tools;35.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
+
+          NDK="$SDK/ndk/26.1.10909125"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$NDK"         >> "$GITHUB_ENV"
+          echo "NDK installed at: $NDK"
+          ls "$NDK/build/cmake/android.toolchain.cmake" && echo "Toolchain OK"
+
+      # ── 4. llama.cpp (cached) ─────────────────────────────────────────────
+      - name: Cache llama.cpp
+        id: cache-llama
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/cpp/llama.cpp
+          key: llama-cpp-b5618-v3
+
+      - name: Clone llama.cpp
+        if: steps.cache-llama.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git clone --depth 1 --branch b5618 \
+            https://github.com/ggml-org/llama.cpp \
+            app/src/main/cpp/llama.cpp
+          ls app/src/main/cpp/llama.cpp/CMakeLists.txt
+
+      # ── 5. gradlew ────────────────────────────────────────────────────────
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      # ── 6. Gradle cache ───────────────────────────────────────────────────
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      # ── 7. Build ──────────────────────────────────────────────────────────
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew assembleRelease \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            --console=plain \
+            2>&1 | tee build.log
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false -Dkotlin.incremental=false -XX:MaxMetaspaceSize=1g"
+
+      # ── 8. On failure: dump FULL error detail ─────────────────────────────
+      - name: Dump errors (failure only)
+        if: failure()
+        shell: bash
+        run: |
+          echo "================================================"
+          echo "KOTLIN ERRORS:"
+          grep -E "^e: " build.log | head -100 || echo "(none)"
+          echo "================================================"
+          echo "WHAT WENT WRONG:"
+          grep -A 40 "FAILURE:" build.log | head -100 || echo "(none)"
+          echo "================================================"
+          echo "C++ / NDK / CMAKE ERRORS:"
+          grep -iE "error:|FAILED|undefined reference|cannot find|No such file" build.log \
+            | grep -vE "^Download|progressLogger|Resolving" | head -80 || echo "(none)"
+          echo "================================================"
+          echo "LAST 300 LINES:"
+          tail -300 build.log
+
+      - name: Save errors to repo
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "# Build Errors — Run ${{ github.run_number }}"
+            echo '```'
+            echo "--- Kotlin errors ---"
+            grep -E "^e: " build.log | head -60 || echo "(none)"
+            echo "--- Gradle failure ---"
+            grep -A 30 "FAILURE:" build.log | head -80 || echo "(none)"
+            echo "--- CMake/NDK errors ---"
+            grep -iE "error:|FAILED|undefined reference" build.log \
+              | grep -vE "^Download|progressLogger" | head -60 || echo "(none)"
+            echo "--- Last 200 lines ---"
+            tail -200 build.log
+            echo '```'
+          } > BUILD-ERRORS.md
+          git config user.name  "astra-ci"
+          git config user.email "astra-ci@users.noreply.github.com"
+          git add -f BUILD-ERRORS.md
+          git commit -m "ci: build errors run ${{ github.run_number }}" || true
+          git push origin HEAD:"$GITHUB_REF_NAME" || true
+
+      - name: Upload full build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ── 9. Package & upload APK ───────────────────────────────────────────
+      - name: Package APK
+        shell: bash
+        run: |
+          APK=$(find app/build/outputs/apk -name "*.apk" 2>/dev/null | head -1)
+          [ -n "$APK" ] || { echo "No APK found!"; find app/build -type f 2>/dev/null | head -30; exit 1; }
+          echo "APK: $APK"
+          cp "$APK" ZENIQ.apk
+          ls -lh ZENIQ.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZENIQ-APK-${{ github.run_number }}
+          path: ZENIQ.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove old build-error report (build passed)
+        if: success() && github.event_name == 'push' && github.ref_type == 'branch' && hashFiles('BUILD-ERRORS.md') != ''
+        shell: bash
+        run: |
+          git config user.name  "astra-ci"
+          git config user.email "astra-ci@users.noreply.github.com"
+          git rm -f BUILD-ERRORS.md
+          git commit -m "ci: build passed, remove old error report" || true
+          git push origin HEAD:"$GITHUB_REF_NAME" || true
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## ZENIQ build"
+            if [ -f ZENIQ.apk ]; then
+              echo "APK built OK ($(du -h ZENIQ.apk | cut -f1))."
+              echo ""
+              echo "Download it from the **Artifacts** section at the bottom of this page (ZENIQ-APK-${{ github.run_number }}),"
+              echo "or from the **Releases** page (tag: latest-build)."
+            else
+              echo "Build did not produce an APK. See the log above."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 10. Rolling latest release ────────────────────────────────────────
+      - name: Update latest release
+        if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-build
+          name: "Latest Build (#${{ github.run_number }})"
+          body: |
+            Auto-built from `main`. Commit: ${{ github.sha }}
+            Download `ZENIQ.apk` below.
+          files: ZENIQ.apk
+          prerelease: true
+          make_latest: false
+
+      # ── 11. Official release on version tags ──────────────────────────────
+      - name: Create version release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ZENIQ.apk
+          generate_release_notes: true
